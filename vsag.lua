@@ -15,7 +15,7 @@
 --
 -- SD persistence (SAFE):
 --   /SCRIPTS/DATA/SagComp_<ModelName>.dat
---   Stores: RECOV, SAG, DOWN, DCR
+--   Stores: RECOV, SAG, DOWN, DCR, CHEM
 -- ============================================================
 
 -- ===== User sensor names =====
@@ -25,6 +25,14 @@ local mySagCellName    = "Sag"    -- compensated per-cell
 local myRawCellName    = "Cell"   -- raw per-cell
 local myThrSourceName  = "ch3"    -- throttle INPUT
 local myRatioName      = "Ratio"  -- 0..100 (%)
+
+-- ===== Chemistry handling (BatP %) =====
+-- 0 = Auto detect (recommended)
+-- 1 = Force LiPo  (4.20V = 100%)
+-- 2 = Force LiHV  (4.35V = 100%)
+local chemistryMode         = 0
+local lihvDetectV           = 4.23   -- latch LiHV if seen >= this V/cell at low throttle
+local lihvDetectSamplesNeed = 3      -- consecutive samples required to latch
 
 -- ===== Timing (centiseconds; 100 = 1s) =====
 local warmupDelayCS    = 200
@@ -141,12 +149,39 @@ local function normalizeVoltage(v)
   return v
 end
 
-local function percentcell(v)
-  local res = 0
+-- LiPo mapping (clamped): 4.20V/cell -> 100%
+local function percentcell_lipo(v)
+  if v == nil then return 0 end
+  if v >= 4.20 then return 100 end
+  if v <= 3.00 then return 0 end
   for _,p in ipairs(myArrayPercentList) do
-    if p[1] >= v then res = p[2]; break end
+    if p[1] >= v then return p[2] end
   end
-  return res
+  return 100
+end
+
+-- LiHV mapping:
+-- - reserve headroom above 4.20 so 4.35 becomes 100%.
+-- - 4.20 maps to ~95% and 4.35 maps to 100%.
+local function percentcell_lihv(v)
+  if v == nil then return 0 end
+  if v >= 4.35 then return 100 end
+  if v <= 3.00 then return 0 end
+  if v <= 4.20 then
+    local p = percentcell_lipo(v)
+    return clamp(math.floor(p * 0.95 + 0.5), 0, 100)
+  end
+  local frac = (v - 4.20) / 0.15
+  local p = 95 + frac * 5
+  return clamp(math.floor(p + 0.5), 0, 100)
+end
+
+-- Chemistry-aware percent
+local function percentcell(v, isLiHV)
+  if isLiHV then
+    return percentcell_lihv(v)
+  end
+  return percentcell_lipo(v)
 end
 
 local function thr01_from_value(thr)
@@ -256,8 +291,6 @@ end
 
 -- ===== decay curve helpers =====
 local function defaultDecay_mVps(i)
-  -- Lower defaults in SC4: we want slow decay even before learning.
-  -- ~0.25 mV/s low -> ~2.2 mV/s high
   local t = bucketMid(i)
   local mv = 0.25 + 1.95 * (t ^ 2.0)
   return clamp(mv, decayMin_mVps, decayMax_mVps)
@@ -307,6 +340,10 @@ local st = {
   lastSaveCS     = 0,
 
   flyingSeen     = false,
+
+  -- chemistry
+  isLiHV = (chemistryMode == 2) and true or ((chemistryMode == 1) and false or nil),
+  lihvDetectCnt = 0,
 }
 
 for i=1,BUCKETS do
@@ -357,13 +394,6 @@ local function sagEst(thr01)
   return st.sag[bucketIndex(thr01)] or 0.0
 end
 
-local function hasAnySagLearned()
-  for i=1,BUCKETS do
-    if st.sag[i] ~= nil then return true end
-  end
-  return false
-end
-
 local function currentRecoverDelayCS()
   return clamp(math.floor(st.recoverLearnCS + 0.5), recoverMinCS, recoverMaxCS)
 end
@@ -389,6 +419,7 @@ local function persistLoadOnce()
     local bucketsOK = false
     local tmpSag, tmpDown, tmpDcr = {}, {}, {}
     local tmpRecover = nil
+    local tmpChem = nil
 
     for line in string.gmatch(data, "([^\n]+)") do
       if line == "SC1" or line == "SC2" or line == "SC3" or line == "SC4" then
@@ -396,6 +427,8 @@ local function persistLoadOnce()
       elseif string.sub(line, 1, 8) == "BUCKETS=" then
         local n = tonumber(string.sub(line, 9))
         bucketsOK = (n == BUCKETS)
+      elseif string.sub(line, 1, 5) == "CHEM=" then
+        tmpChem = string.sub(line, 6)
       elseif string.sub(line, 1, 4) == "SAG=" then
         local parts = splitCSV(string.sub(line, 5))
         for i=1,BUCKETS do
@@ -431,6 +464,12 @@ local function persistLoadOnce()
 
     if tmpRecover then st.recoverLearnCS = clamp(tmpRecover, recoverMinCS, recoverMaxCS) end
 
+    -- Restore chemistry if AUTO mode and value exists
+    if chemistryMode == 0 and tmpChem then
+      if tmpChem == "LIHV" then st.isLiHV = true end
+      if tmpChem == "LIPO" then st.isLiHV = false end
+    end
+
     enforceMonotonicSag()
     extrapolateHighSag()
   end)
@@ -461,10 +500,15 @@ local function persistSaveIfNeeded(now, thr01)
         clamp(Vcs_to_mvps(st.decayVcs[i] or mvps_to_Vcs(defaultDecay_mVps(i))), decayMin_mVps, decayMax_mVps))
     end
 
+    local chemStr = "AUTO"
+    if st.isLiHV == true then chemStr = "LIHV" end
+    if st.isLiHV == false then chemStr = "LIPO" end
+
     local text =
       persistVersion .. "\n" ..
       "BUCKETS=" .. tostring(BUCKETS) .. "\n" ..
       "RECOV=" .. tostring(currentRecoverDelayCS()) .. "\n" ..
+      "CHEM=" .. chemStr .. "\n" ..
       "SAG=" .. table.concat(s, ",") .. "\n" ..
       "DOWN=" .. table.concat(d, ",") .. "\n" ..
       "DCR=" .. table.concat(dc, ",") .. "\n"
@@ -570,6 +614,38 @@ local function updateCapFromRecovery(restRef)
   if old == nil or st.capCell ~= old then st.persistDirty = true end
 end
 
+-- ===== chemistry auto-detect =====
+local function updateChemistry(cellRaw, thr01)
+  if chemistryMode == 1 then
+    if st.isLiHV ~= false then st.isLiHV = false; st.persistDirty = true end
+    st.lihvDetectCnt = 0
+    return
+  end
+  if chemistryMode == 2 then
+    if st.isLiHV ~= true then st.isLiHV = true; st.persistDirty = true end
+    st.lihvDetectCnt = 0
+    return
+  end
+
+  -- Auto
+  if st.isLiHV == true then
+    st.lihvDetectCnt = 0
+    return
+  end
+
+  -- Detect only at low throttle (rest zone) to avoid sag/noise; require consecutive samples.
+  if thr01 <= thrRestPct and cellRaw >= lihvDetectV then
+    st.lihvDetectCnt = st.lihvDetectCnt + 1
+    if st.lihvDetectCnt >= lihvDetectSamplesNeed then
+      st.isLiHV = true
+      st.persistDirty = true
+      st.lihvDetectCnt = 0
+    end
+  else
+    st.lihvDetectCnt = 0
+  end
+end
+
 -- ===== main run() =====
 local function run()
   if thrRampEndPct <= thrNoCompPct then thrRampEndPct = thrNoCompPct + 0.15 end
@@ -596,10 +672,13 @@ local function run()
   local cellCount = math.ceil(packV / 4.35); if cellCount < 1 then cellCount = 1 end
   local cellRaw = clamp(packV / cellCount, cellMin, cellMax)
 
+  local thr01 = thr01_from_value(getValue(myThrSourceName))
+
+  -- Chemistry detection (for BatP mapping)
+  updateChemistry(cellRaw, thr01)
+
   -- initialize capCell once (prevents nil on first flight if you never idle long)
   if st.capCell == nil then st.capCell = cellRaw end
-
-  local thr01 = thr01_from_value(getValue(myThrSourceName))
 
   local ratio = ramp01(thr01, thrNoCompPct, thrRampEndPct)
   local ratioPct = math.floor(ratio * 100 + 0.5)
@@ -756,7 +835,9 @@ local function run()
 
   if cellComp < cellRaw then cellComp = cellRaw end
 
-  local batPct = percentcell(cellComp)
+  -- BatP: chemistry-aware mapping (LiPo vs LiHV)
+  local batPct = percentcell(cellComp, st.isLiHV == true)
+
   setTelemetryValue(0x0310, 0, 1, batPct, 13, 0, myBatPercentName)
   setTelemetryValue(0x0310, 0, 2, math.floor(cellComp * 10 + 0.5), 1, 1, mySagCellName)
   setTelemetryValue(0x0310, 0, 3, math.floor(cellRaw  * 10 + 0.5), 1, 1, myRawCellName)
